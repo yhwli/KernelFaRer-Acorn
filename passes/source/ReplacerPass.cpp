@@ -295,6 +295,73 @@ void buildBLASSYR2KCall(Module &Mod, IRBuilder<> &IR, const Kernel &Syr2k) {
   insertNoInlineCall(Mod, IR, ArgTys, Args, FunctionName);
 }
 
+void buildBLASGEMVCall(Module &Mod, IRBuilder<> &IR,
+                       const KernelFaRer::GEMV &Gemv) {
+
+  const KernelFaRer::Matrix &MA = Gemv.getMatrixA();
+  const KernelFaRer::Matrix &MB = Gemv.getMatrixB();
+  const KernelFaRer::Matrix &MC = Gemv.getMatrixC();
+
+  // Matrix C's layout defines cblas_X() layout bacause it cannot be trasposed.
+  ConstantInt *Layout = IR.getInt32(MC.getLayout());
+  ConstantInt *TransA =
+      IR.getInt32(MA.getLayout() == MC.getLayout() ? CBLAS_TRANSPOSE::NoTrans
+                                                   : CBLAS_TRANSPOSE::Trans);
+  ConstantInt *TransB =
+      IR.getInt32(MB.getLayout() == MC.getLayout() ? CBLAS_TRANSPOSE::NoTrans
+                                                   : CBLAS_TRANSPOSE::Trans);
+
+  // BLAS interface only supports I32 so we will warn when we downcast.
+  bool Downcast = false;
+
+  // Make args for M, N, K.
+  auto *M = prepBLASInt32(IR, &MA.getRows(), Downcast);
+  auto *N = prepBLASInt32(IR, &MB.getColumns(), Downcast);
+
+  // Args for memory pointers to A, B, C
+  auto *A = &MA.getBaseAddressPointer();
+  auto *B = &MB.getBaseAddressPointer();
+  auto *C = &MC.getBaseAddressPointer();
+
+  // Make args for LDA, LDB, LDC.
+  auto *LDA = prepBLASInt32(IR, &MA.getLeadingDimensionSize(), Downcast);
+  auto *LDB = prepBLASInt32(IR, &MB.getLeadingDimensionSize(), Downcast);
+  auto *LDC = prepBLASInt32(IR, &MC.getLeadingDimensionSize(), Downcast);
+
+  // C's pointed to type defines the operation type.
+  auto *OpTy = MC.getScalarElementType();
+
+  // Make args for alpha/beta.
+  Value *Alpha = prepBLASScalar(IR, Gemv.getAlpha(), OpTy);
+  Value *Beta =
+      prepBLASScalar(IR, Gemv.getBeta(), OpTy, Gemv.IsCReduced() ? 1.0 : 0.0);
+
+  // Sanity type checking.
+  assert(MA.getScalarElementType() == OpTy && "A and C are typed differently.");
+  assert(MB.getScalarElementType() == OpTy && "B and C are typed differently.");
+  assert(Alpha->getType() == OpTy && "Alpha and C are typed differently.");
+  assert(Beta->getType() == OpTy && "Beta and C are typed differently.");
+
+  // Send out downcast warning.
+  if (Downcast)
+    errs() << "A BLAS transform argument was larger than i32 and needed to be"
+              " downcast.\nThis operation is potentially illegal.\n";
+
+  
+  // Prepare argument list
+  auto *I32 = IR.getInt32Ty();
+  auto *OpPtrTy = OpTy->getPointerTo();
+  Type *ArgTys[] = {I32, I32, I32, I32, OpTy, OpPtrTy,
+                    I32, OpPtrTy, I32, OpTy, OpPtrTy, I32};
+  Value *Args[] = {Layout, TransA, M, N, Alpha, A, 
+                   LDA, B, LDB, Beta, C, LDC};
+
+  // Insert prepared call in the IR
+  StringRef BlasFunctionName =
+      OpTy == IR.getFloatTy() ? "cblas_sgemv" : "cblas_dgemv";
+  insertNoInlineCall(Mod, IR, ArgTys, Args, BlasFunctionName);
+}
+
 // Adds a call to llvm.matrix.multiply to the IR
 void buildMMIntrinsicCall(IRBuilder<> &IR, const KernelFaRer::GEMM &Gemm) {
 
@@ -549,6 +616,8 @@ bool runImpl(Function &F, KernelMatcher::Result &GMPR, OptimizationRemarkEmitter
         buildBLASGEMMCall(*F.getParent(), IR, *GEMM);
       if (const auto *SYR2K = dyn_cast_or_null<KernelFaRer::SYR2K>(Ker.get()))
         buildBLASSYR2KCall(*F.getParent(), IR, *SYR2K);
+      if (const auto *GEMV = dyn_cast_or_null<KernelFaRer::GEMV>(Ker.get()))
+        buildBLASGEMVCall(*F.getParent(), IR, *GEMV);
     } else if (ReplaceMode == KernelFaRer::EIGEN)
       // Make the call using Eigen runtime interface
       if (const auto *GEMM = dyn_cast_or_null<KernelFaRer::GEMM>(Ker.get()))

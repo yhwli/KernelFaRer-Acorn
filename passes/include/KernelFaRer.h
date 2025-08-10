@@ -100,7 +100,7 @@ public:
 /// loop.
 class Kernel {
 public:
-  enum KernelType { GEMM_KERNEL, SYR2K_KERNEL, UNKNOWN_KERNEL = 0xff };
+  enum KernelType { GEMM_KERNEL, SYR2K_KERNEL, GEMV_KERNEL, UNKNOWN_KERNEL = 0xff };
 
 protected:
   KernelType KernelID;
@@ -199,6 +199,70 @@ public:
     return K->getKernelID() == Kernel::GEMM_KERNEL;
   }
 }; // class GEMM
+
+/// Class that represents a triple-nested loop that computes a general
+/// matrix-matrix multiply.
+class GEMV : public Kernel {
+  bool CIsReduced;
+
+public:
+  GEMV(Loop &L, Instruction &RS, Matrix &MatrixA, Matrix &MatrixB,
+       Matrix &MatrixC, SmallSetVector<const Value *, 2> Stores,
+       bool CIsReduced, Value *Alpha = nullptr, Value *Beta = nullptr)
+      : Kernel(Kernel::GEMV_KERNEL, L, RS, MatrixA, MatrixB, MatrixC, Stores,
+               Alpha, Beta),
+        CIsReduced(CIsReduced) {}
+
+  /// This method indicates if C is part of the reduction or not.
+  bool IsCReduced() const { return CIsReduced; }
+
+  /// This predicate method determines if \p Store is a store to GEMM's result
+  /// matrix.
+  ///
+  /// \param Store a StoreInst to be checked if it a store to GEMM's result
+  /// matrix.
+  ///
+  /// \returns true if \p Store store into GEMM's result matrix and false
+  /// otherwise.
+  bool isKernelStore(const Value &Store) const override {
+    return Stores.count(&Store) != 0;
+  }
+
+  /// This predicate method determines if \p V is one of the values used to
+  /// compute this GEMM.
+  ///
+  /// \param V a value to be checked if it is used to compute GEMM
+  ///
+  /// \returns true if \p V is used to compute GEMM and false otherwise.
+  bool isKernelValue(const Value &V) const override {
+
+    auto &M = MatrixA.getRows();
+    auto &K = MatrixA.getColumns();
+    auto &N = MatrixB.getColumns();
+
+    auto &IndVarI = MatrixA.getRowIV();
+    auto &IndVarK = MatrixA.getColumnIV();
+    auto &IndVarJ = MatrixB.getColumnIV();
+
+    auto &ABaseAddr = MatrixA.getBaseAddressPointer();
+    auto &BBaseAddr = MatrixB.getBaseAddressPointer();
+    auto &CBaseAddr = MatrixC.getBaseAddressPointer();
+
+    auto &LDA = MatrixA.getLeadingDimensionSize();
+    auto &LDB = MatrixB.getLeadingDimensionSize();
+    auto &LDC = MatrixC.getLeadingDimensionSize();
+
+    return (&V == Alpha || &V == Beta || &V == &IndVarI || &V == &IndVarJ ||
+            &V == &IndVarK || &V == &M || &V == &N || &V == &K ||
+            &V == &ABaseAddr || &V == &BBaseAddr || &V == &CBaseAddr ||
+            &V == &LDA || &V == &LDB || &V == &LDC);
+  }
+
+  static inline bool classof(GEMV const *) { return true; }
+  static inline bool classof(Kernel const *K) {
+    return K->getKernelID() == Kernel::GEMV_KERNEL;
+  }
+}; // class GEMV
 
 class SYR2K : public Kernel {
   Value *Uplo;

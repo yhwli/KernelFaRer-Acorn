@@ -407,6 +407,16 @@ collectLoopsWithDepthThreeOrDeeper(LoopInfo &LI,
       collecInnermostLoops(L, Loops);
 }
 
+// A helper function that collects into Loops all loops in a function that are
+// nested at level 2 or deeper
+static void
+collectLoopsWithDepthTwoOrDeeper(LoopInfo &LI,
+                                   SmallSetVector<const Loop *, 8> &Loops) {
+  for (auto *L : LI.getLoopsInPreorder())
+    if (L->getLoopDepth() > 1 && Loops.count(L) == 0)
+      collecInnermostLoops(L, Loops);
+}
+
 // A helper function that returns true iff. either the first or the second
 // operand of PHINode PHI matches the pattern described by matcher. If PHI has
 // more than two operand or none operands matched then this function returns
@@ -500,6 +510,15 @@ static Loop *getOuterLoop(LoopInfo &LI, Value *const &I, Value *const &J,
   auto *C = LI.getLoopFor(static_cast<const PHINode *>(K)->getParent());
   auto *L = A->getLoopDepth() < B->getLoopDepth() ? A : B;
   return L->getLoopDepth() < C->getLoopDepth() ? L : C;
+}
+
+// A helper function that returns the outer loop associated with one of the
+// induction variables I, J, and K.
+static Loop *getOuterLoopTwoLevels(LoopInfo &LI, Value *const &I, Value *const &J) {
+  auto *A = LI.getLoopFor(static_cast<const PHINode *>(I)->getParent());
+  auto *B = LI.getLoopFor(static_cast<const PHINode *>(J)->getParent());
+  auto *L = A->getLoopDepth() < B->getLoopDepth() ? A : B;
+  return L;
 }
 
 // A helper function that detects which access order (Layout) each matrix (A,
@@ -643,6 +662,56 @@ static bool matchSyr2kIndVarAndLayout(Value *const &PtrToA, Value *&PtrToA2,
   return false;
 }
 
+static bool matchMatrixVectorLayout(Value *&PtrToA, Value *&PtrToB, 
+                                    PHINode *&A1, PHINode *&A2, PHINode *&B1,
+                                    PHINode *&B2, PHINode *&C1, PHINode *&C2,
+                                    CBLAS_ORDER &ALayout, CBLAS_ORDER &BLayout,
+                                    CBLAS_ORDER &CLayout, Value *&I, Value *&J,
+                                    Value *&K, LoopInfo &LI) {
+  printf("A1 %d A2 %d B1 %d B2 %d C1 %d C2 %d \n", 
+          A1 == nullptr, A2 == nullptr,
+          B1 == nullptr, B2 == nullptr,
+          C1 == nullptr, C2 == nullptr);
+  printf("I %d J %d K %d \n", 
+          I == nullptr, J == nullptr, K == nullptr);
+  if (A1 == nullptr || B1 == nullptr || C1 == nullptr || C2 != nullptr) {
+    return false;
+  } else if ((A2 != nullptr && B2 != nullptr) || (A2 == nullptr && B2 == nullptr)) {
+    return false;
+  }
+
+  // If matched B as A and A as B, then we swap the matched induction
+  // variables and pointers.
+  if (A2 == nullptr && B2 != nullptr) {
+    std::swap(PtrToA, PtrToB);
+    std::swap(A1, B1);
+    std::swap(A2, B2);
+  }
+  
+  A1 = extractOutermostPHI(A1);
+  A2 = extractOutermostPHI(A2);
+  B1 = extractOutermostPHI(B1);
+  C1 = extractOutermostPHI(C1);
+
+  if (A1 == C1 && A2 == B1) {
+    ALayout = CBLAS_ORDER::RowMajor;
+    BLayout = CBLAS_ORDER::RowMajor;
+    CLayout = CBLAS_ORDER::RowMajor;
+    I = C1; J = B1; K = nullptr;
+
+    return true;
+  } else if (A1 == B1 && A2 == C1) {
+    ALayout = CBLAS_ORDER::ColMajor;
+    BLayout = CBLAS_ORDER::RowMajor;
+    CLayout = CBLAS_ORDER::RowMajor;
+    I = C1; J = B1; K = nullptr;
+
+    return true;
+  }
+
+ return false;
+}
+
 // A helper function that returns true iff. SeedInst is a store instruction
 // that belongs to a Matrix-Multiply pattern. Otherwise this function returns
 // false. When this function returns true all incoming arguments (except
@@ -740,9 +809,59 @@ static bool matchSYR2K(Instruction &SeedInst, Value *&IVarI, Value *&IVarJ,
                         ALayout, BLayout, CLayout, IVarI, IVarJ, IVarK, LI) &&
       match(AddRHS, AddRHSMatcher) &&
       matchSyr2kIndVarAndLayout(BasePtrToA, BasePtrToA2, BasePtrToB,
-                                BasePtrToB2, APHI, BPHI, ALayout, BLayout))
+                                BasePtrToB2, APHI, BPHI, ALayout, BLayout)) {
     IsSYR2K = true;
+  }
   return IsSYR2K;
+}
+
+static bool matchGEMV(Instruction &SeedInst, Value *&IVarI, Value *&IVarJ,
+                      Value *&IVarK, GetElementPtrInst *&GEPA,
+                      Value *&BasePtrToA, GetElementPtrInst *&GEPB,
+                      Value *&BasePtrToB, GetElementPtrInst *&GEPC,
+                      Value *&BasePtrToC, Value *&LDA, Value *&LDB, Value *&LDC,
+                      CBLAS_ORDER &ALayout, CBLAS_ORDER &BLayout,
+                      CBLAS_ORDER &CLayout, LoopInfo &LI, Value *&Alpha,
+                      Value *&Beta, bool &IsCReduced) {
+  auto *SeedInstAsValue = static_cast<Value *>(&SeedInst);
+  Value *Alpha1 = nullptr;
+  PHINode *APHI1 = nullptr;
+  PHINode *APHI2 = nullptr;
+  PHINode *BPHI1 = nullptr;
+  PHINode *BPHI2 = nullptr;
+  PHINode *CPHI1 = nullptr;
+  PHINode *CPHI2 = nullptr;
+  const auto *LoadPtrOp = SeedInst.getOperand(1);
+  Value *MatchedGEP = nullptr;
+
+  // MatMul matcher
+  auto ReductionMatcher =
+      matchFMulFAddPattern(GEPA, GEPB, BasePtrToA, BasePtrToB, APHI1, APHI2,
+                           BPHI1, BPHI2, LDA, LDB, Alpha);
+  auto Matcher = matchStoreOfMatrixC(ReductionMatcher, GEPC, BasePtrToC, CPHI1,
+                                     CPHI2, LDC, MatchedGEP, Alpha1, Beta);
+
+  bool IsGEMV = false;
+  if (match(SeedInstAsValue, Matcher) && BasePtrToA != BasePtrToC &&
+      BasePtrToB != BasePtrToC &&
+      // prevents the match of double scaling with alpha
+      (Alpha == nullptr || Alpha1 == nullptr) &&
+      // LoadPtrOP equals MatchedGEP when old values of C is part of reduction,
+      // i.e., when we have expressions of the form:
+      // C = alpha? * A * B + beta? * C
+      (MatchedGEP == nullptr || MatchedGEP == LoadPtrOp) &&
+      matchMatrixVectorLayout(BasePtrToA, BasePtrToB, APHI1, APHI2, 
+                              BPHI1, BPHI2, CPHI1, CPHI2, ALayout,
+                              BLayout, CLayout, IVarI, IVarJ, IVarK, LI)) {
+    // If Alpha is not match with the reduction matcher, use the matched value
+    // from the store matcher.
+    if (Alpha == nullptr)
+      Alpha = Alpha1;
+    IsCReduced = MatchedGEP != nullptr || Beta != nullptr;
+    IsGEMV = true;
+  }
+
+  return IsGEMV;
 }
 
 // A Helper function to get leading dimension value. In case V is the RHS of a
@@ -859,7 +978,7 @@ KernelMatcher::Result KernelMatcher::run(Function &F, LoopInfo &LI,
   auto ListOfKernels =
       std::make_unique<SmallVector<std::unique_ptr<Kernel>, 4>>();
   SmallSetVector<const Loop *, 8> LoopsToProcess;
-  collectLoopsWithDepthThreeOrDeeper(LI, LoopsToProcess);
+  collectLoopsWithDepthTwoOrDeeper(LI, LoopsToProcess);
   for (const auto *L : LoopsToProcess) {
     for (auto *BB : L->getParentLoop()->getBlocks()) {
       for (auto Inst = BB->begin(); Inst != BB->end(); Inst++) {
@@ -908,10 +1027,23 @@ KernelMatcher::Result KernelMatcher::run(Function &F, LoopInfo &LI,
                    matchLoopUpperBound(LI, static_cast<PHINode *>(IVarJ), N) &&
                    matchLoopUpperBound(LI, static_cast<PHINode *>(IVarK), K)) {
           KT = Kernel::KernelType::GEMM_KERNEL;
+        } else if (matchGEMV(*Inst, IVarI, IVarJ, IVarK, GEPA, BasePtrToA, GEPB,
+                             BasePtrToB, GEPC, BasePtrToC, LDA, LDB, LDC,
+                             ALayout, BLayout, CLayout, LI, Alpha, Beta,
+                             IsCReduced) &&
+                   matchLoopUpperBound(LI, static_cast<PHINode *>(IVarI), M) &&
+                   matchLoopUpperBound(LI, static_cast<PHINode *>(IVarJ), N)) {
+          KT = Kernel::KernelType::GEMV_KERNEL;           
         } else
           continue;
-
-        Loop *OuterLoop = getOuterLoop(LI, IVarI, IVarJ, IVarK);
+        
+        Loop *OuterLoop;
+        if (KT == Kernel::KernelType::GEMV_KERNEL) {
+          OuterLoop = getOuterLoopTwoLevels(LI, IVarI, IVarJ);
+        } else {
+          OuterLoop = getOuterLoop(LI, IVarI, IVarJ, IVarK);
+        }
+          
         // Verify that we only have one block we're exiting from.
         if (OuterLoop->getExitingBlock() == nullptr) {
           auto Header = OuterLoop->getHeader();
@@ -1019,9 +1151,15 @@ KernelMatcher::Result KernelMatcher::run(Function &F, LoopInfo &LI,
                          *N, *IVarK, *IVarJ);
           Matrix MatrixC(*CElType, *BasePtrToC, CLayout, IsCDoublePtr, *LDC, *M,
                          *N, *IVarI, *IVarJ);
-          ListOfKernels->push_back(
+          if (KT == Kernel::KernelType::GEMM_KERNEL) {
+            ListOfKernels->push_back(
               std::make_unique<GEMM>(*OuterLoop, *Inst, MatrixA, MatrixB,
                                      MatrixC, Stores, IsCReduced, Alpha, Beta));
+          } else if (KT == Kernel::KernelType::GEMV_KERNEL) {
+              ListOfKernels->push_back(
+              std::make_unique<GEMV>(*OuterLoop, *Inst, MatrixA, MatrixB,
+                                     MatrixC, Stores, IsCReduced, Alpha, Beta));
+          }
         }
       }
     }
